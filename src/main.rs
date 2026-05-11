@@ -8,17 +8,24 @@
 //!
 //! ## What lives here today
 //!
-//! Phase 1 complete: five domain models registered with
-//! `Admin::new()`, schemas migrated from `migrations/`. The
-//! framework's CRUD pages are reachable at `/admin/reports`,
-//! `/admin/cases`, `/admin/case-actions`, `/admin/documents`,
-//! `/admin/disclosures`.
+//! - Phase 1: five domain models registered with `Admin::new()`,
+//!   schemas migrated from `migrations/`. The framework's CRUD
+//!   pages are reachable at `/admin/reports`, `/admin/cases`,
+//!   `/admin/case-actions`, `/admin/documents`,
+//!   `/admin/disclosures`.
+//! - Phase 2: public anonymous submission flow at
+//!   `/report/new` (GET + POST). Mounted on the root router
+//!   BEFORE `register_admin_routes` so the framework's
+//!   `/admin/*` wildcard never shadows it. CSRF-gated by the
+//!   global middleware. Lands a `Report` row in `status =
+//!   'intake'` and shows the reporter a single-use token for
+//!   future status checks.
 //!
 //! ## What comes next
 //!
-//! - Phase 2: the public anonymous submission page at
-//!   `/report/new`, outside `/admin`. CSRF-gated, captcha
-//!   optional, lands a `Report` row + any `Document` rows.
+//! - Phase 2.5: `/report/status?token=…` reporter self-service
+//!   page for checking the case's current status without
+//!   authenticating.
 //! - Phase 3: handler case workflow — status transitions,
 //!   internal notes, document downloads, all audited via
 //!   `CaseAction`.
@@ -31,6 +38,7 @@
 //!   forensic chain.
 //! - Phase 6: quarterly compliance export.
 
+mod handlers;
 mod models;
 
 use rustio_admin::admin::Admin;
@@ -62,19 +70,41 @@ async fn main() -> Result<()> {
 
     let templates = Templates::new(None)?;
 
+    // Build the router. Middleware order is locked by
+    // DESIGN_AUDIT.md §11: logger → correlation_id →
+    // security_headers → csrf_protect. The R3-era frameworks
+    // assume this order; do not reorder without re-reading
+    // the doctrine.
+    //
+    // The public `/report/*` routes mount BEFORE
+    // `register_admin_routes` so the framework's admin wildcards
+    // never shadow them. The submission flow runs through the
+    // same CSRF + correlation_id middleware as the admin routes,
+    // so failed POSTs still trace through the framework's audit
+    // surface.
     let router = Router::new()
         .middleware(middleware::logger)
-        // Doctrine 8: correlation_id sits BEFORE csrf_protect so
-        // every rejected request still carries a forensic trace.
         .middleware(middleware::correlation_id)
         .middleware(middleware::security_headers)
         .middleware(middleware::csrf_protect)
         .get("/", |_req| async {
             Ok(Response::text(
-                "lursystem alive — see /admin for the admin panel",
+                "lursystem alive — see /report/new to submit a report, \
+                 or /admin for the operator panel",
             ))
         });
 
+    // Public submission flow (Phase 2).
+    let router = router.get("/report/new", |req| async move {
+        handlers::public::show_report_form(req).await
+    });
+    let db_for_submit = db.clone();
+    let router = router.post("/report/new", move |req| {
+        let db = db_for_submit.clone();
+        async move { handlers::public::do_submit_report(db, req).await }
+    });
+
+    // Framework admin surface (R0-R3).
     let router = register_admin_routes(router, admin, db, templates);
 
     let addr: std::net::SocketAddr = "127.0.0.1:8000".parse().expect("bind addr");
