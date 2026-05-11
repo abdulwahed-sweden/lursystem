@@ -151,11 +151,12 @@ pub(crate) async fn do_open_case(db: Db, report_id: i64, req: Request) -> Result
         identity.user_id,
     );
 
-    // Redirect back to the triage queue. Phase 3b's case
-    // detail page (when it lands) will redirect to
-    // /admin/cases/{case_id}/work instead so the lead lands
-    // on the new case directly.
-    Ok(Response::redirect("/admin/triage"))
+    // Redirect onto the freshly-opened case so the lead lands
+    // straight on the work surface — no extra click back through
+    // the triage list. The case detail page (Phase 3b) honours
+    // both Administrator (sees every case) and Staff (sees only
+    // assigned cases), so the lead's redirect always resolves.
+    Ok(Response::redirect(format!("/admin/cases/{case_id}/work")))
 }
 
 // ---- Helpers ---------------------------------------------------------------

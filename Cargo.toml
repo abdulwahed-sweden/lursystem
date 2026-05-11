@@ -21,3 +21,8 @@ log          = "0.4"
 # token-generation site reviewable.
 rand   = "0.8"
 base64 = "0.22"
+# StatusCode values for Response::with_status on non-200 paths
+# (404, 403). The framework itself depends on hyper internally
+# and uses hyper::StatusCode in its handler examples; the
+# explicit dep here makes the project-side use reviewable.
+hyper  = "1"

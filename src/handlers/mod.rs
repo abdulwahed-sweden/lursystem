@@ -8,5 +8,6 @@
 //! pages (`triage`, …) that gate access through
 //! `crate::auth_helper::require_role`.
 
+pub mod cases;
 pub mod public;
 pub mod triage;

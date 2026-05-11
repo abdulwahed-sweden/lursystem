@@ -139,6 +139,22 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Case detail / work surface (Phase 3b). Read-only view of
+    // a single case. Staff+ can read; the in-handler filter
+    // restricts handlers to their own assigned cases while
+    // leads (Administrator+) see every case.
+    let db_for_case_detail = db.clone();
+    let router = router.get("/admin/cases/:case_id/work", move |req| {
+        let db = db_for_case_detail.clone();
+        async move {
+            let case_id: i64 = req
+                .param("case_id")
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0);
+            handlers::cases::show_case_detail(db, case_id, req).await
+        }
+    });
+
     // Framework admin surface (R0-R3).
     let router = register_admin_routes(router, admin, db, templates);
 

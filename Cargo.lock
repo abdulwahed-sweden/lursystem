@@ -1058,6 +1058,7 @@ dependencies = [
  "chrono",
  "dotenvy",
  "env_logger",
+ "hyper",
  "log",
  "rand",
  "rustio-admin",
