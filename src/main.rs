@@ -104,6 +104,19 @@ async fn main() -> Result<()> {
         async move { handlers::public::do_submit_report(db, req).await }
     });
 
+    // Public status-check flow (Phase 2.5). Reporters paste the
+    // token they were shown at submission time; the handler
+    // returns the case's current status. Token rides POST form
+    // body so it stays out of browser history + logger lines.
+    let router = router.get("/report/status", |req| async move {
+        handlers::public::show_status_form(req).await
+    });
+    let db_for_status = db.clone();
+    let router = router.post("/report/status", move |req| {
+        let db = db_for_status.clone();
+        async move { handlers::public::do_status_lookup(db, req).await }
+    });
+
     // Framework admin surface (R0-R3).
     let router = register_admin_routes(router, admin, db, templates);
 

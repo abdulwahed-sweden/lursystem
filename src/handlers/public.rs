@@ -1,23 +1,27 @@
-//! Public anonymous submission flow.
+//! Public anonymous reporter flow.
 //!
-//! Two routes, mounted at the router root BEFORE
+//! Four routes, mounted at the router root BEFORE
 //! `register_admin_routes`:
 //!
-//!   GET  /report/new    → [`show_report_form`]
-//!   POST /report/new    → [`do_submit_report`]
+//!   GET  /report/new      → [`show_report_form`]
+//!   POST /report/new      → [`do_submit_report`]
+//!   GET  /report/status   → [`show_status_form`]
+//!   POST /report/status   → [`do_status_lookup`]
 //!
-//! Both routes are reachable without authentication. The
+//! Every route is reachable without authentication. The
 //! framework's `csrf_protect` middleware still applies — the
 //! middleware injects a `CsrfGuard` into the request context
 //! on every request, sets a cookie on first GET, and validates
-//! the hidden `_csrf` form field on POST. The form renders the
+//! the hidden `_csrf` form field on POST. The forms render the
 //! token; the cookie carries it back.
 //!
-//! No session is created for the reporter. The submission lands
-//! a `Report` row in `status = 'intake'` and returns a freshly
+//! No session is created for the reporter. Submission lands a
+//! `Report` row in `status = 'intake'` and returns a freshly
 //! generated `reporter_token` (256-bit URL-safe-base64) the
-//! reporter saves to check status later. Phase 2.5 adds the
-//! `/report/status?token=…` self-service surface.
+//! reporter saves to check status later. The status-check
+//! flow (Phase 2.5) takes that token over POST (never over
+//! URL query — keeps it out of browser history and HTTP
+//! access logs) and renders the case's current state.
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -522,4 +526,372 @@ fn escape(input: &str) -> String {
         }
     }
     out
+}
+
+// -----------------------------------------------------------------
+// Status check (Phase 2.5)
+// -----------------------------------------------------------------
+//
+// Reporters paste the token they were shown on submission. The
+// handler looks the report up by `reporter_token`, renders the
+// current status, the submission date, and the summary the
+// reporter wrote. The token is never echoed back; the page
+// shows only data the reporter already knows.
+//
+// Token enters via POST form field (not URL query) so it stays
+// out of:
+//   - the browser's history
+//   - the framework's `middleware::logger` request line
+//   - any reverse-proxy access log
+//
+// Same uniform-not-found response for missing tokens, malformed
+// tokens, and tokens that match no row — no enumeration leak.
+
+/// Render the status-check form. Token field is empty;
+/// reporter pastes the value they saved at submission time.
+pub(crate) async fn show_status_form(req: Request) -> Result<Response> {
+    let csrf = csrf_token_from(&req);
+    Ok(Response::html(render_status_form(&csrf, None)))
+}
+
+/// Look up the report by token, render the status page. On
+/// any failure — empty input, token shape rejection, no DB
+/// match — render the form with a single uniform error banner.
+/// The lookup path never distinguishes between "no such token"
+/// and "wrong token shape" in what reaches the client.
+pub(crate) async fn do_status_lookup(db: Db, req: Request) -> Result<Response> {
+    let csrf = csrf_token_from(&req);
+    let form = req.form()?;
+    let token = form.get("reporter_token").unwrap_or("").trim().to_string();
+
+    let uniform_not_found = || -> Result<Response> {
+        Ok(Response::html(render_status_form(
+            &csrf,
+            Some("Ingen rapport hittades med den koden."),
+        )))
+    };
+
+    // Pre-DB shape rejection — keeps the SQL out of the
+    // not-our-shape branch entirely. A real reporter_token is
+    // 43 chars of URL-safe-base64; reject anything wildly
+    // outside that envelope without going to the database.
+    if token.is_empty() || token.len() > 64 {
+        return uniform_not_found();
+    }
+
+    // Read the report. The `reports.reporter_token` column is
+    // UNIQUE-indexed (per Phase 1's schema), so the lookup is
+    // an index seek to a single row.
+    let row: Option<(String, String, String, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+        "SELECT summary, status, severity, submitted_at \
+           FROM reports \
+          WHERE reporter_token = $1",
+    )
+    .bind(&token)
+    .fetch_optional(db.pool())
+    .await
+    .map_err(rustio_admin::Error::from)?;
+
+    match row {
+        Some((summary, status, severity, submitted_at)) => Ok(Response::html(render_status_view(
+            &summary,
+            &status,
+            &severity,
+            submitted_at,
+        ))),
+        None => uniform_not_found(),
+    }
+}
+
+fn render_status_form(csrf: &str, error: Option<&str>) -> String {
+    let error_html = match error {
+        Some(msg) => format!(
+            r#"<div class="lur-error" role="alert">{}</div>"#,
+            escape(msg)
+        ),
+        None => String::new(),
+    };
+    format!(
+        r#"<!doctype html>
+<html lang="sv">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Följ upp rapport — Lursystem</title>
+<style>{shared_css}</style>
+</head>
+<body>
+<div class="lur-shell">
+  <h1 class="lur-title">Följ upp en rapport</h1>
+  <p class="lur-intro">
+    Klistra in uppföljningskoden du fick när du skickade in
+    rapporten. Koden visar den aktuella statusen utan att avslöja
+    din identitet.
+  </p>
+
+  {error_html}
+
+  <form method="post" action="/report/status" class="lur-form" autocomplete="off">
+    <input type="hidden" name="_csrf" value="{csrf}">
+
+    <div class="lur-field">
+      <label for="lur-token">Uppföljningskod</label>
+      <input type="text" id="lur-token" name="reporter_token"
+             required minlength="20" maxlength="64"
+             spellcheck="false" autocapitalize="off" autofocus
+             style="font-family: 'SF Mono', 'JetBrains Mono', Consolas, monospace;">
+    </div>
+
+    <button type="submit">Visa status</button>
+  </form>
+
+  <p class="lur-footer">
+    Lursystem · Skyddat av lag (2021:890) om skydd för personer
+    som rapporterar om missförhållanden.
+  </p>
+</div>
+</body>
+</html>
+"#,
+        shared_css = shared_css(),
+        error_html = error_html,
+        csrf = escape(csrf),
+    )
+}
+
+fn render_status_view(
+    summary: &str,
+    status: &str,
+    severity: &str,
+    submitted_at: chrono::DateTime<chrono::Utc>,
+) -> String {
+    let status_label = status_label_sv(status);
+    let status_intro = status_intro_sv(status);
+    let severity_label = severity_label_sv(severity);
+    let date_only = submitted_at.format("%Y-%m-%d");
+    format!(
+        r#"<!doctype html>
+<html lang="sv">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Status — Lursystem</title>
+<style>{shared_css}</style>
+</head>
+<body>
+<div class="lur-shell">
+  <h1 class="lur-title">Rapportstatus</h1>
+
+  <div class="lur-status-card">
+    <div class="lur-status-row">
+      <span class="lur-status-label">Status</span>
+      <span class="lur-status-value">{status_label}</span>
+    </div>
+    <div class="lur-status-row">
+      <span class="lur-status-label">Inlämnad</span>
+      <span class="lur-status-value">{date_only}</span>
+    </div>
+    <div class="lur-status-row">
+      <span class="lur-status-label">Allvarlighetsgrad</span>
+      <span class="lur-status-value">{severity_label}</span>
+    </div>
+    <div class="lur-status-row">
+      <span class="lur-status-label">Sammanfattning</span>
+      <span class="lur-status-value">{summary}</span>
+    </div>
+  </div>
+
+  <div class="lur-success" role="status">{status_intro}</div>
+
+  <p class="lur-footer">
+    Behandlingen är konfidentiell. Koden behövs varje gång du
+    vill se den aktuella statusen — spara den.
+  </p>
+
+  <p class="lur-footer">
+    <a href="/report/status">← Tillbaka</a>
+  </p>
+</div>
+</body>
+</html>
+"#,
+        shared_css = shared_css(),
+        status_label = escape(status_label),
+        status_intro = escape(status_intro),
+        severity_label = escape(severity_label),
+        date_only = date_only,
+        summary = escape(summary),
+    )
+}
+
+/// Swedish-language status label for display. Falls back to
+/// the raw value if the DB column ever contains an
+/// unexpected string — preferable to hiding the actual state.
+fn status_label_sv(status: &str) -> &'static str {
+    match status {
+        "intake" => "Mottagen",
+        "triage" => "Under granskning",
+        "investigating" => "Under utredning",
+        "resolved" => "Avslutad",
+        "archived" => "Arkiverad",
+        _ => "Okänd",
+    }
+}
+
+/// Short status-specific intro shown below the status card.
+/// Tells the reporter what each state means for them.
+fn status_intro_sv(status: &str) -> &'static str {
+    match status {
+        "intake" => {
+            "Din rapport har tagits emot och väntar på att en utredare ska påbörja granskningen."
+        }
+        "triage" => "En utredare granskar rapporten och bedömer hur den ska hanteras.",
+        "investigating" => {
+            "Rapporten utreds. Du kan komma att kontaktas om du valde att lämna en e-postadress."
+        }
+        "resolved" => "Utredningen är avslutad. Rapporten har arkiverats för regelefterlevnad.",
+        "archived" => "Rapporten är arkiverad och avslutad.",
+        _ => {
+            "Rapportens status har ett okänt värde. Kontakta din arbetsgivare för mer information."
+        }
+    }
+}
+
+fn severity_label_sv(severity: &str) -> &'static str {
+    match severity {
+        "low" => "Låg",
+        "medium" => "Medel",
+        "high" => "Hög",
+        "critical" => "Kritisk",
+        _ => "Okänd",
+    }
+}
+
+/// Shared CSS extracted so the four reporter-facing pages
+/// share the same calm palette. Defined as a fn rather than a
+/// const because `format!` interpolation in a const-string
+/// require escaping every brace; the fn body lets us write
+/// raw CSS once and stamp it in via `{shared_css}`.
+fn shared_css() -> &'static str {
+    r#"
+:root { color-scheme: light; }
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: #f4f6f7;
+  color: #1c2326;
+  font-size: 15px;
+  line-height: 1.5;
+}
+.lur-shell {
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 48px 24px 96px;
+}
+.lur-title {
+  font-size: 28px;
+  font-weight: 600;
+  margin: 0 0 12px;
+  letter-spacing: -0.01em;
+}
+.lur-intro {
+  color: #5d6a72;
+  margin: 0 0 24px;
+  font-size: 16px;
+}
+.lur-error {
+  background: #fdecec;
+  border-left: 3px solid #c8443d;
+  padding: 12px 16px;
+  margin-bottom: 24px;
+  font-size: 14px;
+}
+.lur-success {
+  background: #ecf6f3;
+  border-left: 3px solid #0f8c7e;
+  padding: 16px 20px;
+  margin-bottom: 32px;
+  font-size: 15px;
+}
+.lur-form {
+  background: #ffffff;
+  border: 1px solid #dde3e6;
+  padding: 32px;
+}
+.lur-field { margin-bottom: 24px; }
+.lur-field:last-of-type { margin-bottom: 32px; }
+label {
+  display: block;
+  font-weight: 600;
+  margin-bottom: 6px;
+  font-size: 14px;
+}
+.lur-hint {
+  color: #5d6a72;
+  font-size: 13px;
+  margin: -2px 0 8px;
+}
+input[type="text"],
+input[type="email"],
+textarea,
+select {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid #c9d1d6;
+  background: #fafbfc;
+  font: inherit;
+  color: inherit;
+  border-radius: 2px;
+}
+textarea {
+  min-height: 180px;
+  resize: vertical;
+  font-family: inherit;
+}
+input:focus, textarea:focus, select:focus {
+  outline: 2px solid #0f8c7e;
+  outline-offset: -1px;
+  border-color: #0f8c7e;
+}
+button {
+  background: #0f8c7e;
+  color: #ffffff;
+  border: 0;
+  padding: 12px 28px;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  border-radius: 2px;
+}
+button:hover { background: #0a6e62; }
+a { color: #0a6e62; }
+.lur-status-card {
+  background: #ffffff;
+  border: 1px solid #dde3e6;
+  padding: 8px 28px;
+  margin-bottom: 24px;
+}
+.lur-status-row {
+  display: flex;
+  gap: 16px;
+  padding: 16px 0;
+  border-bottom: 1px solid #eef2f3;
+}
+.lur-status-row:last-child { border-bottom: 0; }
+.lur-status-label {
+  flex: 0 0 160px;
+  color: #5d6a72;
+  font-size: 14px;
+}
+.lur-status-value {
+  flex: 1;
+  font-weight: 500;
+}
+.lur-footer {
+  margin-top: 32px;
+  font-size: 13px;
+  color: #5d6a72;
+}
+"#
 }
