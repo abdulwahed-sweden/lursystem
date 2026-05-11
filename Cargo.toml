@@ -26,3 +26,12 @@ base64 = "0.22"
 # and uses hyper::StatusCode in its handler examples; the
 # explicit dep here makes the project-side use reviewable.
 hyper  = "1"
+# Compliance-export serialisation + HMAC-SHA256 signing
+# (Phase 6). All four crates are already in the transitive tree
+# via rustio-admin's R3 MFA stack; declaring them as direct
+# deps makes the signing site at `handlers/export.rs`
+# reviewable without chasing transitive resolution.
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+hmac        = "0.12"
+sha2        = "0.10"

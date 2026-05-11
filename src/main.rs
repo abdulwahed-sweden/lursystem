@@ -248,6 +248,20 @@ async fn main() -> Result<()> {
         async move { handlers::audit::show_audit_log(db, req).await }
     });
 
+    // Compliance export (Phase 6). Tamper-evident JSON artefact
+    // covering every audit-bearing row in a date range, signed
+    // with HMAC-SHA256 keyed by RUSTIO_SECRET_KEY. The Phase 4
+    // privacy invariant is preserved — reporter_email is NOT in
+    // the export. Reporter identities still require the Phase 4
+    // disclosure flow. Supervisor-or-higher only; mounted before
+    // register_admin_routes so the framework's wildcards do not
+    // shadow it.
+    let db_for_export = db.clone();
+    let router = router.get("/admin/audit/export", move |req| {
+        let db = db_for_export.clone();
+        async move { handlers::export::do_export(db, req).await }
+    });
+
     // Framework admin surface (R0-R3).
     let router = register_admin_routes(router, admin, db, templates);
 

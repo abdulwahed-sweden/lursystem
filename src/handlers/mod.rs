@@ -11,5 +11,6 @@
 pub mod audit;
 pub mod cases;
 pub mod disclosure;
+pub mod export;
 pub mod public;
 pub mod triage;

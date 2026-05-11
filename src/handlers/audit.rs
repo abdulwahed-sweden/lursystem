@@ -52,7 +52,7 @@
 //!   re-classify audit rows from this surface. The framework has
 //!   no DELETE path on case_actions or disclosures either.
 
-use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Utc};
 
 use rustio_admin::auth::Role;
 use rustio_admin::{Db, Request, Response, Result};
@@ -307,6 +307,7 @@ fn status_label_sv(status: &str) -> &'static str {
 fn render(actor_email: &str, filters: &AuditFilters, total: i64, rows: &[AuditRow]) -> String {
     let chips_html = render_filter_chips(filters);
     let filter_form_html = render_filter_form(filters);
+    let export_form_html = render_export_form();
     let rows_html = render_rows(rows);
     let pagination_html = render_pagination(filters, total);
 
@@ -352,6 +353,11 @@ fn render(actor_email: &str, filters: &AuditFilters, total: i64, rows: &[AuditRo
     {filter_form_html}
   </section>
 
+  <section class="lur-section lur-section-export">
+    <h2>Signerad export</h2>
+    {export_form_html}
+  </section>
+
   <section class="lur-section">
     <h2>Händelser</h2>
     {rows_html}
@@ -365,6 +371,7 @@ fn render(actor_email: &str, filters: &AuditFilters, total: i64, rows: &[AuditRo
         total_label = escape(&total_label),
         chips_html = chips_html,
         filter_form_html = filter_form_html,
+        export_form_html = export_form_html,
         rows_html = rows_html,
         pagination_html = pagination_html,
         css = operator_css(),
@@ -510,6 +517,67 @@ fn render_filter_form(filters: &AuditFilters) -> String {
         actor = escape(actor_value),
         case = escape(&case_value),
         since = escape(&since_value),
+    )
+}
+
+/// Date-range form that submits to `/admin/audit/export`. The
+/// default dates point at the last full quarter so the
+/// "quarterly compliance export" path is a one-click submit; the
+/// auditor can override the dates manually for ad-hoc ranges.
+fn render_export_form() -> String {
+    let (from_default, to_default) = last_full_quarter_range();
+    format!(
+        r#"<form method="get" action="/admin/audit/export" class="lur-export-form">
+  <p class="lur-export-lede">Signerad JSON-export över valt datumintervall.
+  Filen omfattar varje rapport, ärende, åtgärd och identitetsupplysning i
+  perioden — utan reporterns e-postadress, vilken alltid kräver
+  Phase 4-flödet. HMAC-SHA256 över <code>payload</code> med
+  <code>RUSTIO_SECRET_KEY</code> som nyckel.</p>
+  <div class="lur-export-grid">
+    <label>Från
+      <input type="date" name="from" value="{from_default}" required>
+    </label>
+    <label>Till
+      <input type="date" name="to" value="{to_default}" required>
+    </label>
+    <div class="lur-export-submit">
+      <button type="submit">Ladda ner signerad export</button>
+    </div>
+  </div>
+</form>
+"#,
+        from_default = from_default,
+        to_default = to_default,
+    )
+}
+
+/// Compute the [from, to] dates for the most recently *closed*
+/// quarter, used as defaults on the export form. Run on
+/// 2026-05-11 → returns ("2026-01-01", "2026-03-31") (Q1
+/// closed; we are now in Q2 which is still open).
+fn last_full_quarter_range() -> (String, String) {
+    let today: NaiveDate = Utc::now().date_naive();
+    let year = today.year();
+    let month = today.month();
+    let current_q = (month - 1) / 3 + 1; // 1..=4
+    let (q_year, q_index) = if current_q == 1 {
+        (year - 1, 4)
+    } else {
+        (year, current_q - 1)
+    };
+    let from_month = (q_index - 1) * 3 + 1;
+    let to_month_start = from_month + 3;
+    let from = NaiveDate::from_ymd_opt(q_year, from_month, 1).expect("valid quarter start");
+    let to = if to_month_start > 12 {
+        NaiveDate::from_ymd_opt(q_year + 1, 1, 1).expect("Jan 1 valid")
+    } else {
+        NaiveDate::from_ymd_opt(q_year, to_month_start, 1).expect("valid quarter end")
+    }
+    .pred_opt()
+    .expect("subtract one day");
+    (
+        from.format("%Y-%m-%d").to_string(),
+        to.format("%Y-%m-%d").to_string(),
     )
 }
 
@@ -842,6 +910,62 @@ main.lur-op-audit { max-width: 1280px; }
   font-size: 12px;
 }
 .lur-cancel:hover { color: #0a6e62; text-decoration: underline; }
+.lur-section-export {
+  border-color: #e6d18a;
+  background: #fdf8e8;
+}
+.lur-section-export h2 { color: #6d5108; }
+.lur-export-lede {
+  margin: 0 0 14px;
+  font-size: 13px;
+  color: #4a3a14;
+  line-height: 1.6;
+  max-width: 760px;
+}
+.lur-export-lede code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  background: #fcf6e3;
+  padding: 1px 5px;
+  border-radius: 2px;
+  border: 1px solid #e6d18a;
+}
+.lur-export-grid {
+  display: grid;
+  grid-template-columns: 180px 180px 1fr;
+  gap: 14px 18px;
+  align-items: end;
+}
+.lur-export-grid label {
+  display: flex;
+  flex-direction: column;
+  font-size: 12px;
+  color: #6d5108;
+  font-weight: 600;
+  gap: 6px;
+}
+.lur-export-grid input {
+  padding: 7px 10px;
+  border: 1px solid #c9b58c;
+  background: #ffffff;
+  font: inherit;
+  font-size: 13px;
+  color: #1c2326;
+  border-radius: 2px;
+}
+.lur-export-submit { text-align: right; }
+.lur-export-submit button {
+  background: #c69a3a;
+  color: #ffffff;
+  border: 0;
+  padding: 9px 18px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  border-radius: 2px;
+}
+.lur-export-submit button:hover { background: #a47e26; }
 .lur-audit-table {
   width: 100%;
   border-collapse: collapse;
