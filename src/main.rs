@@ -3,42 +3,61 @@
 //! See `README.md` for the project's scope, role hierarchy, and
 //! build roadmap. Security-sensitive behaviour (sessions, MFA,
 //! audit, recovery) is governed by the rustio-admin DESIGN_*.md
-//! contracts.
+//! contracts; the project-side code lives in `src/models/` and
+//! (Phase 2+) `src/handlers/`.
 //!
 //! ## What lives here today
 //!
-//! Bare boot. `Admin::new()` with no project schemas registered
-//! yet — the framework's User / Group / Permission surface is
-//! the only thing reachable at `/admin`. The five domain models
-//! (Report, Case, CaseAction, Document, Disclosure) land in
-//! subsequent commits per the README's build roadmap.
+//! Phase 1 complete: five domain models registered with
+//! `Admin::new()`, schemas migrated from `migrations/`. The
+//! framework's CRUD pages are reachable at `/admin/reports`,
+//! `/admin/cases`, `/admin/case-actions`, `/admin/documents`,
+//! `/admin/disclosures`.
 //!
 //! ## What comes next
 //!
-//! 1. Database migrations for the 5 domain tables.
-//! 2. Model registrations (`Admin::model::<Report>()`, etc.).
-//! 3. The public anonymous submission page (outside `/admin`).
-//! 4. The handler case workflow + reporter-identity unmask.
-//! 5. The auditor read-only surface.
-//! 6. The quarterly export.
+//! - Phase 2: the public anonymous submission page at
+//!   `/report/new`, outside `/admin`. CSRF-gated, captcha
+//!   optional, lands a `Report` row + any `Document` rows.
+//! - Phase 3: handler case workflow — status transitions,
+//!   internal notes, document downloads, all audited via
+//!   `CaseAction`.
+//! - Phase 4: reporter-identity unmask. Re-auth required;
+//!   `Disclosure` row written; framework's audit chain ties
+//!   the disclosure to the request, the session, and the
+//!   compliance lead.
+//! - Phase 5: auditor read-only surface — audit-log view
+//!   with a `correlation_id` pivot to reconstruct the full
+//!   forensic chain.
+//! - Phase 6: quarterly compliance export.
+
+mod models;
 
 use rustio_admin::admin::Admin;
 use rustio_admin::middleware;
 use rustio_admin::templates::Templates;
-use rustio_admin::{auth, register_admin_routes, Db, Response, Result, Router, Server};
+use rustio_admin::{auth, migrations, register_admin_routes, Db, Response, Result, Router, Server};
+
+use models::{Case, CaseAction, Disclosure, Document, Report};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     env_logger::init();
 
-    let database_url = std::env::var("DATABASE_URL")
-        .expect("DATABASE_URL must be set (see .env.example)");
+    let database_url =
+        std::env::var("DATABASE_URL").expect("DATABASE_URL must be set (see .env.example)");
 
     let db = Db::connect(&database_url).await?;
     auth::init_tables(&db).await?;
+    migrations::apply(&db, "migrations").await?;
 
-    let admin = Admin::new();
+    let admin = Admin::new()
+        .model::<Report>()
+        .model::<Case>()
+        .model::<CaseAction>()
+        .model::<Document>()
+        .model::<Disclosure>();
     admin.seed_permissions(&db).await?;
 
     let templates = Templates::new(None)?;
