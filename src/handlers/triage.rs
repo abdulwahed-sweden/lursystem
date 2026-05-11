@@ -47,7 +47,7 @@
 //! signal, captured in `case_actions`.
 
 use rustio_admin::auth::Role;
-use rustio_admin::middleware::CsrfGuard;
+use rustio_admin::middleware::{CorrelationId, CsrfGuard};
 use rustio_admin::{Db, Request, Response, Result};
 
 use crate::auth_helper::{require_role, AccessGuard};
@@ -130,14 +130,19 @@ pub(crate) async fn do_open_case(db: Db, report_id: i64, req: Request) -> Result
         .await
         .map_err(rustio_admin::Error::from)?;
 
-    // 4. INSERT the case-level audit overlay row.
+    // 4. INSERT the case-level audit overlay row, with the
+    //    request's correlation_id so the Phase 5 audit surface
+    //    can pivot from this event to every other event under
+    //    the same HTTP request.
+    let correlation = req.ctx().get::<CorrelationId>().map(|c| c.0.clone());
     sqlx::query(
-        "INSERT INTO case_actions (case_id, actor_id, action_type, note) \
-         VALUES ($1, $2, 'case_opened', $3)",
+        "INSERT INTO case_actions (case_id, actor_id, action_type, note, correlation_id) \
+         VALUES ($1, $2, 'case_opened', $3, $4)",
     )
     .bind(case_id)
     .bind(identity.user_id)
     .bind(format!("Opened from report #{report_id}"))
+    .bind(correlation)
     .execute(&mut *tx)
     .await
     .map_err(rustio_admin::Error::from)?;

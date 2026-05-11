@@ -54,7 +54,7 @@
 //! ```
 
 use rustio_admin::auth::Role;
-use rustio_admin::middleware::CsrfGuard;
+use rustio_admin::middleware::{CorrelationId, CsrfGuard};
 use rustio_admin::{Db, Request, Response, Result};
 
 use crate::auth_helper::{is_session_elevated, require_role, AccessGuard};
@@ -224,27 +224,36 @@ pub(crate) async fn do_disclose(db: Db, case_id: i64, req: Request) -> Result<Re
     };
 
     // Write the disclosure row. This IS the audit event.
+    // `correlation_id` is captured from the framework's
+    // middleware-injected context so the Phase 5 audit surface
+    // can pivot from this disclosure row to the matching
+    // case_actions row + every other framework-level audit row
+    // under the same request.
+    let correlation = req.ctx().get::<CorrelationId>().map(|c| c.0.clone());
     sqlx::query(
-        "INSERT INTO disclosures (case_id, requested_by, reason) \
-         VALUES ($1, $2, $3)",
+        "INSERT INTO disclosures (case_id, requested_by, reason, correlation_id) \
+         VALUES ($1, $2, $3, $4)",
     )
     .bind(case_id)
     .bind(identity.user_id)
     .bind(&reason)
+    .bind(&correlation)
     .execute(&mut *tx)
     .await
     .map_err(rustio_admin::Error::from)?;
 
     // Write the case-level audit row so the case history
     // surface ("Historik" on /admin/cases/:id/work) shows the
-    // disclosure event alongside the rest of the workflow.
+    // disclosure event alongside the rest of the workflow. Same
+    // correlation_id ties this row to the disclosures row above.
     sqlx::query(
-        "INSERT INTO case_actions (case_id, actor_id, action_type, note) \
-         VALUES ($1, $2, 'disclosure_consumed', $3)",
+        "INSERT INTO case_actions (case_id, actor_id, action_type, note, correlation_id) \
+         VALUES ($1, $2, 'disclosure_consumed', $3, $4)",
     )
     .bind(case_id)
     .bind(identity.user_id)
     .bind(&reason)
+    .bind(&correlation)
     .execute(&mut *tx)
     .await
     .map_err(rustio_admin::Error::from)?;

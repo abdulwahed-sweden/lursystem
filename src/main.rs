@@ -234,6 +234,20 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Auditor read-only surface (Phase 5). Gated at
+    // `Role::Supervisor` (the audit floor — supervisors review;
+    // staff handlers do not see other handlers' work through this
+    // surface). The page is read-only — no forms, no mutations.
+    // Filters via query string: action_type, correlation, actor,
+    // case, since-date. Paginated at 50/page. Each row carries a
+    // correlation_id link so an auditor can pivot to every event
+    // under the same HTTP request.
+    let db_for_audit = db.clone();
+    let router = router.get("/admin/audit", move |req| {
+        let db = db_for_audit.clone();
+        async move { handlers::audit::show_audit_log(db, req).await }
+    });
+
     // Framework admin surface (R0-R3).
     let router = register_admin_routes(router, admin, db, templates);
 

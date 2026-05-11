@@ -42,7 +42,7 @@
 //!    in the next commit.
 
 use rustio_admin::auth::Role;
-use rustio_admin::middleware::CsrfGuard;
+use rustio_admin::middleware::{CorrelationId, CsrfGuard};
 use rustio_admin::{Db, Request, Response, Result};
 
 use crate::auth_helper::{is_session_elevated, require_role, AccessGuard};
@@ -286,14 +286,18 @@ pub(crate) async fn do_status_transition(db: Db, case_id: i64, req: Request) -> 
         .await
         .map_err(rustio_admin::Error::from)?;
 
-    // 3. INSERT the case_actions audit overlay row.
+    // 3. INSERT the case_actions audit overlay row, with the
+    //    request's correlation_id so Phase 5's audit pivot can
+    //    follow the chain.
+    let correlation = req.ctx().get::<CorrelationId>().map(|c| c.0.clone());
     sqlx::query(
-        "INSERT INTO case_actions (case_id, actor_id, action_type, note) \
-         VALUES ($1, $2, 'status_changed', $3)",
+        "INSERT INTO case_actions (case_id, actor_id, action_type, note, correlation_id) \
+         VALUES ($1, $2, 'status_changed', $3, $4)",
     )
     .bind(case_id)
     .bind(identity.user_id)
     .bind(format!("{current_status} → {target_status}"))
+    .bind(correlation)
     .execute(&mut *tx)
     .await
     .map_err(rustio_admin::Error::from)?;
@@ -346,13 +350,15 @@ pub(crate) async fn do_add_note(db: Db, case_id: i64, req: Request) -> Result<Re
         return Ok(forbidden());
     }
 
+    let correlation = req.ctx().get::<CorrelationId>().map(|c| c.0.clone());
     sqlx::query(
-        "INSERT INTO case_actions (case_id, actor_id, action_type, note) \
-         VALUES ($1, $2, 'note_added', $3)",
+        "INSERT INTO case_actions (case_id, actor_id, action_type, note, correlation_id) \
+         VALUES ($1, $2, 'note_added', $3, $4)",
     )
     .bind(case_id)
     .bind(identity.user_id)
     .bind(&note)
+    .bind(correlation)
     .execute(db.pool())
     .await
     .map_err(rustio_admin::Error::from)?;
@@ -447,14 +453,16 @@ pub(crate) async fn do_reassign(db: Db, case_id: i64, req: Request) -> Result<Re
         .await
         .map_err(rustio_admin::Error::from)?;
 
+    let correlation = req.ctx().get::<CorrelationId>().map(|c| c.0.clone());
     sqlx::query(
-        "INSERT INTO case_actions (case_id, actor_id, action_type, note) \
-         VALUES ($1, $2, $3, $4)",
+        "INSERT INTO case_actions (case_id, actor_id, action_type, note, correlation_id) \
+         VALUES ($1, $2, $3, $4, $5)",
     )
     .bind(case_id)
     .bind(identity.user_id)
     .bind(action_type)
     .bind(&note)
+    .bind(correlation)
     .execute(&mut *tx)
     .await
     .map_err(rustio_admin::Error::from)?;
