@@ -8,7 +8,7 @@ description = "Self-hosted whistleblower-reporting and case-handling system for 
 repository = "https://github.com/abdulwahed-sweden/lursystem"
 
 [dependencies]
-rustio-admin = "0.7"
+rustio-admin = "0.8"
 tokio        = { version = "1", features = ["macros", "rt-multi-thread"] }
 chrono       = { version = "0.4", features = ["serde"] }
 sqlx         = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres"] }
