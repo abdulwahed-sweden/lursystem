@@ -1,0 +1,17 @@
+[package]
+name = "lursystem"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+description = "Self-hosted whistleblower-reporting and case-handling system for Swedish employers. Built on rustio-admin."
+repository = "https://github.com/abdulwahed-sweden/lursystem"
+
+[dependencies]
+rustio-admin = "0.7"
+tokio        = { version = "1", features = ["macros", "rt-multi-thread"] }
+chrono       = { version = "0.4", features = ["serde"] }
+sqlx         = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres"] }
+dotenvy      = "0.15"
+env_logger   = "0.11"
+log          = "0.4"
