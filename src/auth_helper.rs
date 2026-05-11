@@ -47,6 +47,8 @@
 //!
 //! Lifts when rustio-admin publishes a `pub guards` module.
 
+use chrono::{DateTime, Utc};
+
 use rustio_admin::auth::{self, Identity, Role};
 use rustio_admin::{Db, Request, Response, Result};
 
@@ -111,4 +113,52 @@ pub async fn require_role(db: &Db, req: &Request, min_role: Role) -> Result<Acce
     }
 
     Ok(AccessGuard::Allow(identity))
+}
+
+/// Whether the request's session has been re-authenticated
+/// within `RecoveryPolicy::reauth_window()` (default 15 min).
+///
+/// ## Framework gap (rustio-admin 0.7)
+///
+/// `auth::recovery_admin::check_session_elevated` is the
+/// canonical reader, but the `recovery_admin` module is
+/// `pub(crate)` so project code cannot reach it. Until the
+/// framework lifts that module (or just this function) into
+/// the public API, we query `rustio_sessions.elevated_until`
+/// directly. Same comparison logic the framework uses.
+///
+/// The framework's R2 `do_reauth` handler is the canonical
+/// writer of `elevated_until`. Project code that wants to
+/// gate destructive admin actions (Phase 3c's terminal
+/// status transitions, Phase 4's reporter unmask) checks
+/// elevation via this helper, then redirects to
+/// `/admin/reauth?return_to=…` if the session is not yet
+/// elevated.
+pub async fn is_session_elevated(db: &Db, req: &Request) -> Result<bool> {
+    let cookie = match req.header("cookie") {
+        Some(c) => c,
+        None => return Ok(false),
+    };
+    let token = match auth::session_token_from_cookie(cookie) {
+        Some(t) => t,
+        None => return Ok(false),
+    };
+    let session_id = match auth::current_session_id(db, token.as_str()).await? {
+        Some(sid) => sid,
+        None => return Ok(false),
+    };
+    let elevated_until: Option<DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT elevated_until FROM rustio_sessions \
+          WHERE session_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(session_id)
+    .fetch_optional(db.pool())
+    .await
+    .map_err(rustio_admin::Error::from)?
+    .flatten();
+
+    Ok(match elevated_until {
+        Some(eu) => eu > Utc::now(),
+        None => false,
+    })
 }

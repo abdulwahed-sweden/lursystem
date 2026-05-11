@@ -155,6 +155,55 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Case workflow mutations (Phase 3c). Three POSTs hung off
+    // the case detail page:
+    //
+    //   /admin/cases/:case_id/status    — status transition
+    //                                     (terminal targets
+    //                                     require re-auth)
+    //   /admin/cases/:case_id/notes     — internal note
+    //   /admin/cases/:case_id/reassign  — change assignee
+    //                                     (lead-only)
+    //
+    // Each writes a `case_actions` row + updates the relevant
+    // primary state (`cases.status` / `cases.assignee_id`).
+    // The terminal-status path stamps `cases.closed_at`.
+    let db_for_status = db.clone();
+    let router = router.post("/admin/cases/:case_id/status", move |req| {
+        let db = db_for_status.clone();
+        async move {
+            let case_id: i64 = req
+                .param("case_id")
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0);
+            handlers::cases::do_status_transition(db, case_id, req).await
+        }
+    });
+
+    let db_for_notes = db.clone();
+    let router = router.post("/admin/cases/:case_id/notes", move |req| {
+        let db = db_for_notes.clone();
+        async move {
+            let case_id: i64 = req
+                .param("case_id")
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0);
+            handlers::cases::do_add_note(db, case_id, req).await
+        }
+    });
+
+    let db_for_reassign = db.clone();
+    let router = router.post("/admin/cases/:case_id/reassign", move |req| {
+        let db = db_for_reassign.clone();
+        async move {
+            let case_id: i64 = req
+                .param("case_id")
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0);
+            handlers::cases::do_reassign(db, case_id, req).await
+        }
+    });
+
     // Framework admin surface (R0-R3).
     let router = register_admin_routes(router, admin, db, templates);
 

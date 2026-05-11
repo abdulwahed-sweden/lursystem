@@ -1,17 +1,21 @@
 //! Case detail page — the handler's primary workflow surface.
 //!
-//! ## Route
+//! ## Routes
 //!
-//! - `GET /admin/cases/:case_id/work` → [`show_case_detail`]
+//! - `GET  /admin/cases/:case_id/work`      → [`show_case_detail`]
+//! - `POST /admin/cases/:case_id/status`    → [`do_status_transition`]
+//! - `POST /admin/cases/:case_id/notes`     → [`do_add_note`]
+//! - `POST /admin/cases/:case_id/reassign`  → [`do_reassign`]
 //!
 //! ## Authority
 //!
-//! Gated at `Role::Staff` (handler tier) via the project's
-//! `auth_helper::require_role`, with an in-handler filter:
-//!
-//! - Compliance leads (Administrator or higher) see every case.
-//! - Handlers (Staff) see only cases where they are the assignee.
-//! - Anyone else falls back to 403.
+//! - `show_case_detail` and `do_add_note` and `do_status_transition`:
+//!   gated at `Role::Staff` with the in-handler filter
+//!   (Administrator+ sees every case; Staff sees only their
+//!   own assigned case; otherwise 403).
+//! - `do_reassign`: gated at `Role::Administrator` — only the
+//!   compliance lead can reassign cases. The reassign form is
+//!   conditionally rendered only when the viewer is a lead.
 //!
 //! ## What this page shows (Phase 3b)
 //!
@@ -38,9 +42,70 @@
 //!    in the next commit.
 
 use rustio_admin::auth::Role;
+use rustio_admin::middleware::CsrfGuard;
 use rustio_admin::{Db, Request, Response, Result};
 
-use crate::auth_helper::{require_role, AccessGuard};
+use crate::auth_helper::{is_session_elevated, require_role, AccessGuard};
+
+// ---- Locked decisions (Phase 3c) -------------------------------------------
+
+/// Internal-note size envelope. Floor catches accidental empty
+/// submits; ceiling sits well below Postgres TEXT limits but
+/// far enough above any real handler note that good-faith
+/// users will never bump it.
+const NOTE_MIN: usize = 3;
+const NOTE_MAX: usize = 5_000;
+
+/// Reassignment-target role floor. Cases get assigned to a
+/// `Staff`-or-higher user (Handler, Compliance lead,
+/// Developer). The reporter role (`User`) is never assignable.
+const ASSIGNABLE_ROLES: &[&str] = &["staff", "supervisor", "administrator", "developer"];
+
+// ---- Status state machine --------------------------------------------------
+
+/// Returns the list of valid `target_status` values for a
+/// case currently in `current_status`. An empty result means
+/// the case is in a terminal state; the workflow buttons
+/// render nothing.
+///
+/// Locked transitions:
+///   triage        → investigating | archived
+///   investigating → resolved | triage
+///   resolved      → archived
+///   archived      → (terminal — no transitions)
+///
+/// "investigating → triage" is the de-escalation path used
+/// when an investigator decides the case should go back to the
+/// triage queue (e.g. needs more information from the reporter,
+/// needs reassignment to a different handler with different
+/// expertise).
+fn allowed_next_statuses(current: &str) -> &'static [&'static str] {
+    match current {
+        "triage" => &["investigating", "archived"],
+        "investigating" => &["resolved", "triage"],
+        "resolved" => &["archived"],
+        _ => &[],
+    }
+}
+
+/// Whether the transition `current → target` requires re-auth.
+/// Terminal transitions (`resolved`, `archived`) demand a
+/// fresh elevation because they are operationally
+/// irreversible — once a case is marked resolved, the
+/// investigation is signed off; once archived, the case is
+/// closed for compliance review.
+fn transition_requires_reauth(target: &str) -> bool {
+    matches!(target, "resolved" | "archived")
+}
+
+/// Whether the transition is terminal — `closed_at` gets
+/// stamped via direct sqlx for these (the framework's
+/// `RustioAdmin` derive doesn't support
+/// `Option<DateTime<Utc>>` so the column lives in SQL but
+/// not on the `Case` Rust struct).
+fn is_terminal_status(status: &str) -> bool {
+    matches!(status, "resolved" | "archived")
+}
 
 // ---- Case detail (GET /admin/cases/:case_id/work) --------------------------
 
@@ -108,13 +173,309 @@ pub(crate) async fn show_case_detail(db: Db, case_id: i64, req: Request) -> Resu
     .await
     .map_err(rustio_admin::Error::from)?;
 
+    // Reassign-target list. Loaded only for compliance leads;
+    // handlers viewing their own case don't see the reassign
+    // form so the SELECT is skipped for them.
+    let assignable_users: Vec<AssignableUser> = if is_lead {
+        sqlx::query_as::<_, AssignableUser>(
+            "SELECT id, email \
+               FROM rustio_users \
+              WHERE is_active = TRUE \
+                AND role IN ('staff', 'supervisor', 'administrator', 'developer') \
+              ORDER BY email",
+        )
+        .fetch_all(db.pool())
+        .await
+        .map_err(rustio_admin::Error::from)?
+    } else {
+        Vec::new()
+    };
+
+    let csrf = req
+        .ctx()
+        .get::<CsrfGuard>()
+        .map(|g| g.token.clone())
+        .unwrap_or_default();
+
     Ok(Response::html(render_detail(
         &identity.email,
+        is_lead,
         &case,
         &report,
         assignee_email.as_deref(),
         &actions,
+        &assignable_users,
+        &csrf,
     )))
+}
+
+// ---- POST /admin/cases/:case_id/status -------------------------------------
+
+pub(crate) async fn do_status_transition(db: Db, case_id: i64, req: Request) -> Result<Response> {
+    let identity = match require_role(&db, &req, Role::Staff).await? {
+        AccessGuard::Redirect(r) => return Ok(r),
+        AccessGuard::Allow(i) => i,
+    };
+
+    let form = req.form()?;
+    let target_status = form.get("target_status").unwrap_or("").trim().to_string();
+
+    // Load the current case state. Authority filter (Staff
+    // sees only their own assigned case) re-applied here.
+    let row: Option<(i64, Option<i64>, String)> =
+        sqlx::query_as("SELECT report_id, assignee_id, status FROM cases WHERE id = $1")
+            .bind(case_id)
+            .fetch_optional(db.pool())
+            .await
+            .map_err(rustio_admin::Error::from)?;
+
+    let (report_id, assignee_id, current_status) = match row {
+        Some(t) => t,
+        None => return Ok(Response::redirect("/admin/triage")),
+    };
+
+    let is_lead = identity.role.includes(Role::Administrator);
+    if !is_lead && assignee_id != Some(identity.user_id) {
+        return Ok(forbidden());
+    }
+
+    // Validate the transition against the state machine.
+    if !allowed_next_statuses(&current_status).contains(&target_status.as_str()) {
+        return Ok(redirect_back(case_id));
+    }
+
+    // Terminal transitions require a fresh elevated-session.
+    // A handler clicking "Mark resolved" without recent
+    // re-auth bounces to /admin/reauth?return_to=… and lands
+    // back on the case detail page after re-auth, where they
+    // click the button again.
+    if transition_requires_reauth(&target_status) && !is_session_elevated(&db, &req).await? {
+        return Ok(Response::redirect(format!(
+            "/admin/reauth?return_to=/admin/cases/{case_id}/work"
+        )));
+    }
+
+    // Execute the transition atomically.
+    let mut tx = db.pool().begin().await.map_err(rustio_admin::Error::from)?;
+
+    // 1. UPDATE cases.status (+ closed_at on terminal).
+    if is_terminal_status(&target_status) {
+        sqlx::query("UPDATE cases SET status = $1, closed_at = NOW() WHERE id = $2")
+            .bind(&target_status)
+            .bind(case_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(rustio_admin::Error::from)?;
+    } else {
+        // Non-terminal transition. closed_at stays NULL.
+        sqlx::query("UPDATE cases SET status = $1 WHERE id = $2")
+            .bind(&target_status)
+            .bind(case_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(rustio_admin::Error::from)?;
+    }
+
+    // 2. UPDATE reports.status to keep the reporter's view
+    //    in sync. The reporter's /report/status page reads
+    //    the report's column directly.
+    sqlx::query("UPDATE reports SET status = $1 WHERE id = $2")
+        .bind(&target_status)
+        .bind(report_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(rustio_admin::Error::from)?;
+
+    // 3. INSERT the case_actions audit overlay row.
+    sqlx::query(
+        "INSERT INTO case_actions (case_id, actor_id, action_type, note) \
+         VALUES ($1, $2, 'status_changed', $3)",
+    )
+    .bind(case_id)
+    .bind(identity.user_id)
+    .bind(format!("{current_status} → {target_status}"))
+    .execute(&mut *tx)
+    .await
+    .map_err(rustio_admin::Error::from)?;
+
+    tx.commit().await.map_err(rustio_admin::Error::from)?;
+
+    log::info!(
+        "lursystem: case status transition id={} {} → {} by user_id={}",
+        case_id,
+        current_status,
+        target_status,
+        identity.user_id,
+    );
+
+    Ok(redirect_back(case_id))
+}
+
+// ---- POST /admin/cases/:case_id/notes --------------------------------------
+
+pub(crate) async fn do_add_note(db: Db, case_id: i64, req: Request) -> Result<Response> {
+    let identity = match require_role(&db, &req, Role::Staff).await? {
+        AccessGuard::Redirect(r) => return Ok(r),
+        AccessGuard::Allow(i) => i,
+    };
+
+    let form = req.form()?;
+    let note = form.get("note").unwrap_or("").trim().to_string();
+
+    if note.len() < NOTE_MIN || note.len() > NOTE_MAX {
+        // Silently ignore out-of-envelope notes. The form's
+        // client-side `minlength` / `maxlength` attrs catch
+        // these client-side; this server-side check is the
+        // belt to the form's braces.
+        return Ok(redirect_back(case_id));
+    }
+
+    // Authority filter: load the case, gate on assignee or
+    // lead role.
+    let row: Option<(Option<i64>,)> = sqlx::query_as("SELECT assignee_id FROM cases WHERE id = $1")
+        .bind(case_id)
+        .fetch_optional(db.pool())
+        .await
+        .map_err(rustio_admin::Error::from)?;
+    let assignee_id = match row {
+        Some((a,)) => a,
+        None => return Ok(Response::redirect("/admin/triage")),
+    };
+    let is_lead = identity.role.includes(Role::Administrator);
+    if !is_lead && assignee_id != Some(identity.user_id) {
+        return Ok(forbidden());
+    }
+
+    sqlx::query(
+        "INSERT INTO case_actions (case_id, actor_id, action_type, note) \
+         VALUES ($1, $2, 'note_added', $3)",
+    )
+    .bind(case_id)
+    .bind(identity.user_id)
+    .bind(&note)
+    .execute(db.pool())
+    .await
+    .map_err(rustio_admin::Error::from)?;
+
+    log::info!(
+        "lursystem: case note added id={} by user_id={} len={}",
+        case_id,
+        identity.user_id,
+        note.len(),
+    );
+
+    Ok(redirect_back(case_id))
+}
+
+// ---- POST /admin/cases/:case_id/reassign -----------------------------------
+
+pub(crate) async fn do_reassign(db: Db, case_id: i64, req: Request) -> Result<Response> {
+    // Reassignment is a Compliance-lead-only action — distinct
+    // from the Staff-gated routes above. Handlers cannot
+    // reassign themselves or others.
+    let identity = match require_role(&db, &req, Role::Administrator).await? {
+        AccessGuard::Redirect(r) => return Ok(r),
+        AccessGuard::Allow(i) => i,
+    };
+
+    let form = req.form()?;
+    let target_assignee_id: i64 = form
+        .get("assignee_id")
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+
+    if target_assignee_id <= 0 {
+        return Ok(redirect_back(case_id));
+    }
+
+    // Validate the target user. Must exist, be active, and
+    // carry one of the assignable roles. A hostile lead
+    // submitting an arbitrary user_id (e.g. a Reporter's
+    // user_id) bounces here.
+    let target_user: Option<(String, String)> = sqlx::query_as(
+        "SELECT email, role FROM rustio_users \
+          WHERE id = $1 AND is_active = TRUE",
+    )
+    .bind(target_assignee_id)
+    .fetch_optional(db.pool())
+    .await
+    .map_err(rustio_admin::Error::from)?;
+
+    let (target_email, target_role) = match target_user {
+        Some(t) => t,
+        None => return Ok(redirect_back(case_id)),
+    };
+    if !ASSIGNABLE_ROLES.contains(&target_role.as_str()) {
+        return Ok(redirect_back(case_id));
+    }
+
+    // Load the case to determine action_type (assigned vs
+    // reassigned) and to short-circuit no-op reassignments.
+    let row: Option<(Option<i64>,)> = sqlx::query_as("SELECT assignee_id FROM cases WHERE id = $1")
+        .bind(case_id)
+        .fetch_optional(db.pool())
+        .await
+        .map_err(rustio_admin::Error::from)?;
+    let previous_assignee = match row {
+        Some((a,)) => a,
+        None => return Ok(Response::redirect("/admin/triage")),
+    };
+
+    if previous_assignee == Some(target_assignee_id) {
+        // Lead picked the current assignee from the dropdown.
+        // No-op — skip the writes.
+        return Ok(redirect_back(case_id));
+    }
+
+    let action_type = if previous_assignee.is_some() {
+        "reassigned"
+    } else {
+        "assigned"
+    };
+    let note = match previous_assignee {
+        Some(prev) => format!("user_id {prev} → user_id {target_assignee_id} ({target_email})"),
+        None => format!("Assigned to user_id {target_assignee_id} ({target_email})"),
+    };
+
+    // Atomic: UPDATE cases.assignee_id + INSERT case_actions.
+    let mut tx = db.pool().begin().await.map_err(rustio_admin::Error::from)?;
+
+    sqlx::query("UPDATE cases SET assignee_id = $1 WHERE id = $2")
+        .bind(target_assignee_id)
+        .bind(case_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(rustio_admin::Error::from)?;
+
+    sqlx::query(
+        "INSERT INTO case_actions (case_id, actor_id, action_type, note) \
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(case_id)
+    .bind(identity.user_id)
+    .bind(action_type)
+    .bind(&note)
+    .execute(&mut *tx)
+    .await
+    .map_err(rustio_admin::Error::from)?;
+
+    tx.commit().await.map_err(rustio_admin::Error::from)?;
+
+    log::info!(
+        "lursystem: case {} id={} new_assignee=user_id:{} by user_id={}",
+        action_type,
+        case_id,
+        target_assignee_id,
+        identity.user_id,
+    );
+
+    Ok(redirect_back(case_id))
+}
+
+// ---- Shared helpers --------------------------------------------------------
+
+fn redirect_back(case_id: i64) -> Response {
+    Response::redirect(format!("/admin/cases/{case_id}/work"))
 }
 
 // ---- Row structs (sqlx FromRow) --------------------------------------------
@@ -154,6 +515,12 @@ struct ActionRow {
     note: String,
     created_at: chrono::DateTime<chrono::Utc>,
     actor_email: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct AssignableUser {
+    id: i64,
+    email: String,
 }
 
 // ---- Swedish labels --------------------------------------------------------
@@ -210,12 +577,16 @@ fn action_type_label_sv(action_type: &str) -> &'static str {
 
 // ---- Rendering -------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn render_detail(
     actor_email: &str,
+    is_lead: bool,
     case: &CaseRow,
     report: &ReportRow,
     assignee_email: Option<&str>,
     actions: &[ActionRow],
+    assignable_users: &[AssignableUser],
+    csrf: &str,
 ) -> String {
     let assignee_html = match assignee_email {
         Some(email) => format!(r#"<strong>{}</strong>"#, escape(email)),
@@ -238,6 +609,8 @@ fn render_detail(
 </div>"#
             .to_string()
     };
+
+    let workflow_html = render_workflow_forms(is_lead, case, assignable_users, csrf);
 
     let history_html = if actions.is_empty() {
         r#"<p class="lur-muted">Inga åtgärder registrerade.</p>"#.to_string()
@@ -327,8 +700,7 @@ fn render_detail(
 
   <section class="lur-section">
     <h2>Åtgärder</h2>
-    <p class="lur-muted">Statusändringar, anteckningar och tilldelningar — kommande
-    funktion (Phase 3c).</p>
+    {workflow_html}
   </section>
 </main>
 </body>
@@ -347,9 +719,124 @@ fn render_detail(
         summary = escape(&report.summary),
         body = escape(&report.body),
         history_html = history_html,
+        workflow_html = workflow_html,
         actor_email = escape(actor_email),
         css = operator_css(),
     )
+}
+
+fn render_workflow_forms(
+    is_lead: bool,
+    case: &CaseRow,
+    assignable_users: &[AssignableUser],
+    csrf: &str,
+) -> String {
+    let case_id = case.id;
+    let mut buf = String::new();
+
+    // --- Status transitions ---
+    let next_statuses = allowed_next_statuses(&case.status);
+    if next_statuses.is_empty() {
+        buf.push_str(
+            r#"<div class="lur-workflow-block">
+  <p class="lur-muted">Ärendet är avslutat. Inga statusändringar möjliga.</p>
+</div>
+"#,
+        );
+    } else {
+        buf.push_str(
+            r#"<div class="lur-workflow-block">
+  <h3 class="lur-workflow-title">Ändra status</h3>
+  <div class="lur-workflow-buttons">
+"#,
+        );
+        for target in next_statuses {
+            let reauth_warning = if transition_requires_reauth(target) {
+                r#"<span class="lur-reauth-marker" title="Kräver återautentisering">↑</span>"#
+            } else {
+                ""
+            };
+            buf.push_str(&format!(
+                r#"    <form method="post" action="/admin/cases/{case_id}/status">
+      <input type="hidden" name="_csrf" value="{csrf}">
+      <input type="hidden" name="target_status" value="{target}">
+      <button type="submit" class="lur-btn-{target}">→ {label}{reauth}</button>
+    </form>
+"#,
+                case_id = case_id,
+                csrf = escape(csrf),
+                target = escape(target),
+                label = escape(status_label_sv(target)),
+                reauth = reauth_warning,
+            ));
+        }
+        buf.push_str("  </div>\n");
+        buf.push_str(
+            r#"  <p class="lur-workflow-hint">Statusändringar markerade med ↑
+  kräver en färsk återautentisering (lösenord + 2FA om aktiverat).</p>
+"#,
+        );
+        buf.push_str("</div>\n");
+    }
+
+    // --- Internal notes ---
+    buf.push_str(&format!(
+        r#"<div class="lur-workflow-block">
+  <h3 class="lur-workflow-title">Lägg till intern anteckning</h3>
+  <form method="post" action="/admin/cases/{case_id}/notes" class="lur-notes-form">
+    <input type="hidden" name="_csrf" value="{csrf}">
+    <textarea name="note" rows="4" required minlength="{NOTE_MIN}" maxlength="{NOTE_MAX}"
+              placeholder="Anteckningen syns endast för utredare och granskare."></textarea>
+    <button type="submit">Spara anteckning</button>
+  </form>
+</div>
+"#,
+        case_id = case_id,
+        csrf = escape(csrf),
+        NOTE_MIN = NOTE_MIN,
+        NOTE_MAX = NOTE_MAX,
+    ));
+
+    // --- Reassign (compliance lead only) ---
+    if is_lead {
+        let options = if assignable_users.is_empty() {
+            r#"<option value="" disabled>Inga utredare tillgängliga</option>"#.to_string()
+        } else {
+            let mut opts = String::new();
+            for u in assignable_users {
+                let selected = if case.assignee_id == Some(u.id) {
+                    " selected"
+                } else {
+                    ""
+                };
+                opts.push_str(&format!(
+                    r#"<option value="{id}"{selected}>{email}</option>"#,
+                    id = u.id,
+                    selected = selected,
+                    email = escape(&u.email),
+                ));
+            }
+            opts
+        };
+        buf.push_str(&format!(
+            r#"<div class="lur-workflow-block">
+  <h3 class="lur-workflow-title">Tilldela ärende</h3>
+  <form method="post" action="/admin/cases/{case_id}/reassign" class="lur-reassign-form">
+    <input type="hidden" name="_csrf" value="{csrf}">
+    <select name="assignee_id" required>
+      {options}
+    </select>
+    <button type="submit">Spara tilldelning</button>
+  </form>
+</div>
+"#,
+            case_id = case_id,
+            csrf = escape(csrf),
+            options = options,
+        ));
+    }
+
+    buf
 }
 
 fn not_found() -> Response {
@@ -558,6 +1045,106 @@ main.lur-op-detail { max-width: 880px; }
   margin: 6px 0 0;
   color: #1c2326;
   font-size: 13px;
+}
+.lur-workflow-block {
+  padding: 16px 0;
+  border-bottom: 1px solid #eef2f3;
+}
+.lur-workflow-block:last-child { border-bottom: 0; padding-bottom: 0; }
+.lur-workflow-block:first-child { padding-top: 0; }
+.lur-workflow-title {
+  font-size: 13px;
+  font-weight: 600;
+  margin: 0 0 12px;
+  letter-spacing: 0.01em;
+  text-transform: none;
+  color: #1c2326;
+}
+.lur-workflow-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+}
+.lur-workflow-buttons button {
+  background: #ffffff;
+  color: #1c2326;
+  border: 1px solid #c9d1d6;
+  padding: 8px 16px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  border-radius: 2px;
+}
+.lur-workflow-buttons button:hover {
+  border-color: #0f8c7e;
+  color: #0a6e62;
+}
+.lur-btn-resolved,
+.lur-btn-archived {
+  background: #fafbfc !important;
+  border-color: #c9b58c !important;
+  color: #4a3a14 !important;
+}
+.lur-btn-resolved:hover,
+.lur-btn-archived:hover {
+  border-color: #c69a3a !important;
+  color: #4a3a14 !important;
+}
+.lur-reauth-marker {
+  display: inline-block;
+  margin-left: 4px;
+  color: #c69a3a;
+  font-weight: 700;
+}
+.lur-workflow-hint {
+  margin: 12px 0 0;
+  font-size: 12px;
+  color: #5d6a72;
+  max-width: 580px;
+}
+.lur-notes-form textarea {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid #c9d1d6;
+  background: #fafbfc;
+  font: inherit;
+  font-size: 14px;
+  color: inherit;
+  border-radius: 2px;
+  resize: vertical;
+  min-height: 96px;
+  margin-bottom: 12px;
+}
+.lur-notes-form button,
+.lur-reassign-form button {
+  background: #0f8c7e;
+  color: #ffffff;
+  border: 0;
+  padding: 8px 18px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  border-radius: 2px;
+}
+.lur-notes-form button:hover,
+.lur-reassign-form button:hover { background: #0a6e62; }
+.lur-reassign-form {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+.lur-reassign-form select {
+  padding: 8px 12px;
+  border: 1px solid #c9d1d6;
+  background: #fafbfc;
+  font: inherit;
+  font-size: 13px;
+  color: inherit;
+  border-radius: 2px;
+  min-width: 280px;
 }
 a { color: #0a6e62; }
 "#
