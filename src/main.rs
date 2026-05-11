@@ -204,6 +204,36 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Reporter-identity unmask (Phase 4). Compliance-lead-only.
+    // The GET bounces to /admin/reauth if the session is not
+    // elevated; the POST writes a `disclosures` row + a
+    // `case_actions` row (action_type='disclosure_consumed')
+    // atomically and renders the reporter's e-mail to the lead.
+    // The case detail page never renders the e-mail — each
+    // viewing of the identity is an audited event.
+    let db_for_disclose_get = db.clone();
+    let router = router.get("/admin/cases/:case_id/disclose", move |req| {
+        let db = db_for_disclose_get.clone();
+        async move {
+            let case_id: i64 = req
+                .param("case_id")
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0);
+            handlers::disclosure::show_disclose_form(db, case_id, req).await
+        }
+    });
+    let db_for_disclose_post = db.clone();
+    let router = router.post("/admin/cases/:case_id/disclose", move |req| {
+        let db = db_for_disclose_post.clone();
+        async move {
+            let case_id: i64 = req
+                .param("case_id")
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0);
+            handlers::disclosure::do_disclose(db, case_id, req).await
+        }
+    });
+
     // Framework admin surface (R0-R3).
     let router = register_admin_routes(router, admin, db, templates);
 

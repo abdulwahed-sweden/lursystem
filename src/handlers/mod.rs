@@ -9,5 +9,6 @@
 //! `crate::auth_helper::require_role`.
 
 pub mod cases;
+pub mod disclosure;
 pub mod public;
 pub mod triage;

@@ -594,13 +594,26 @@ fn render_detail(
     };
 
     let reporter_html = if report.has_email {
-        r#"<div class="lur-reporter-state">
+        let disclose_link = if is_lead {
+            format!(
+                r#"<p class="lur-reporter-action">
+  <a class="lur-disclose-cta" href="/admin/cases/{case_id}/disclose">→ Begär identitetsupplysning</a>
+  <span class="lur-reauth-marker" title="Kräver återautentisering">↑</span>
+</p>"#,
+                case_id = case.id,
+            )
+        } else {
+            String::new()
+        };
+        format!(
+            r#"<div class="lur-reporter-state">
   <span class="lur-pill lur-pill-warn">E-post angiven</span>
   <p>Reporterns e-post finns lagrad men visas inte här. För att
   läsa identiteten krävs en formell identitetsupplysning som
-  loggas i ärendet (kommande funktion — Phase 4).</p>
+  loggas oåterkalleligt i ärendet. Varje visning loggas separat.</p>
+  {disclose_link}
 </div>"#
-            .to_string()
+        )
     } else {
         r#"<div class="lur-reporter-state">
   <span class="lur-pill lur-pill-neutral">Anonym rapport</span>
@@ -982,6 +995,24 @@ main.lur-op-detail { max-width: 880px; }
   font-size: 13px;
   color: #5d6a72;
   max-width: 580px;
+}
+.lur-reporter-action {
+  margin-top: 16px !important;
+  font-size: 13px !important;
+}
+.lur-disclose-cta {
+  display: inline-block;
+  padding: 8px 16px;
+  background: #fcf6e3;
+  border: 1px solid #c9b58c;
+  color: #4a3a14 !important;
+  font-weight: 600;
+  text-decoration: none;
+  border-radius: 2px;
+}
+.lur-disclose-cta:hover {
+  background: #f6e8b8;
+  border-color: #c69a3a;
 }
 .lur-pill {
   display: inline-block;
