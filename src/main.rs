@@ -38,6 +38,7 @@
 //!   forensic chain.
 //! - Phase 6: quarterly compliance export.
 
+mod auth_helper;
 mod handlers;
 mod models;
 
@@ -115,6 +116,27 @@ async fn main() -> Result<()> {
     let router = router.post("/report/status", move |req| {
         let db = db_for_status.clone();
         async move { handlers::public::do_status_lookup(db, req).await }
+    });
+
+    // Operator triage queue (Phase 3a). Compliance-lead-gated
+    // via `auth_helper::require_role(Role::Administrator)`.
+    // Mounts BEFORE `register_admin_routes` so the framework's
+    // model-CRUD wildcards never shadow these paths.
+    let db_for_triage = db.clone();
+    let router = router.get("/admin/triage", move |req| {
+        let db = db_for_triage.clone();
+        async move { handlers::triage::show_triage_queue(db, req).await }
+    });
+    let db_for_open = db.clone();
+    let router = router.post("/admin/triage/:report_id/open-case", move |req| {
+        let db = db_for_open.clone();
+        async move {
+            let report_id: i64 = req
+                .param("report_id")
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0);
+            handlers::triage::do_open_case(db, report_id, req).await
+        }
     });
 
     // Framework admin surface (R0-R3).
